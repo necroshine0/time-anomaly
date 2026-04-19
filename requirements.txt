@@ -1,0 +1,5 @@
+pylint==4.0.5
+einops==0.8.2
+jaxtyping==0.3.7
+tensorboard==2.20.0
+werkzeug==3.0.2
