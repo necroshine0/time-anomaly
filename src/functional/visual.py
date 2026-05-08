@@ -8,33 +8,15 @@ def plot_training_results(results: dict, title_prefix=None):
     train_losses = results["train_losses"]
     valid_losses = results["valid_losses"]
 
-    fig, axes = plt.subplots(ncols=3, figsize=(15, 4))
-    axes[0].plot(epochs, train_losses["total"], label="train")
-    axes[0].plot(epochs, valid_losses["total"], label="valid")
+    fig = plt.figure(figsize=(12, 4))
+    plt.plot(epochs, train_losses["reconstruction"], label="train")
+    plt.plot(epochs, valid_losses["reconstruction"], label="valid")
     if title_prefix:
-        axes[0].set_title(f"{title_prefix}: total loss")
+        plt.title(f"{title_prefix}: reconstruction loss")
     else:
-        axes[0].set_title("total loss")
-    axes[0].legend()
-    axes[0].grid()
-
-    axes[1].plot(epochs, train_losses["reconstruction"], label="train")
-    axes[1].plot(epochs, valid_losses["reconstruction"], label="valid")
-    if title_prefix:
-        axes[1].set_title(f"{title_prefix}: reconstruction loss")
-    else:
-        axes[1].set_title("reconstruction loss")
-    axes[1].legend()
-    axes[1].grid()
-
-    axes[2].plot(epochs, train_losses["anomaly"], label="train")
-    axes[2].plot(epochs, valid_losses["anomaly"], label="valid")
-    if title_prefix:
-        axes[2].set_title(f"{title_prefix}: anomaly loss")
-    else:
-        axes[2].set_title("anomaly loss")
-    axes[2].legend()
-    axes[2].grid()
+        plt.title("reconstruction loss")
+    plt.legend()
+    plt.grid()
 
     plt.tight_layout()
     plt.show()

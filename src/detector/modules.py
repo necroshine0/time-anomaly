@@ -23,9 +23,9 @@ class RoPELayer(nn.Module):
 
 
 class BinaryAttentionBias(nn.Module):
-    """Binary Variate Attention for time series data."""
-    def __init__(self,
-                 num_heads: Int):
+    """Binary Variate Attention for time series data.
+    Used for Any-Variate Attention with flattening channel strategy aka PatchTST, TimeRCD"""
+    def __init__(self, num_heads: Int):
         super().__init__()
         self.num_heads = num_heads
         self.emd = nn.Embedding(2, num_heads)
@@ -166,7 +166,6 @@ class LlamaMLP(nn.Module):
 
 class TransformerEncoderLayerWithRoPE(nn.Module):
     """Transformer Encoder Layer with RoPE and RMSNorm."""
-
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu", num_features=1):
         super().__init__()
         self.self_attn = MultiheadAttentionWithRoPE(d_model, nhead, num_features)
@@ -212,10 +211,9 @@ class CustomTransformerEncoder(nn.Module):
         return output
 
 
-
-class TimeSeriesEncoder(nn.Module):
+class TimeSeriesEncoderBase(nn.Module):
     """
-    Time Series Encoder with PatchTST-like patching, RoPE.
+    Time Series Encoder Base class.
 
     Args:
         d_model (int): Model dimension
@@ -295,6 +293,35 @@ class TimeSeriesEncoder(nn.Module):
 
     def forward(self, time_series, mask):
         """Forward pass to generate local embeddings."""
+        raise NotImplementedError
+
+
+class TimeSeriesEncoderFlatten(TimeSeriesEncoderBase):
+    """
+    Time Series Encoder with PatchTST-like patching.
+    Using channel-flattening strategy aka PatchTST, TimeRCD.
+
+    Args:
+        d_model (int): Model dimension
+        d_proj (int): Projection dimension
+        patch_size (int): Size of each patch
+        num_layers (int): Number of encoder layers
+        num_heads (int): Number of attention heads
+        d_ff_dropout (float): Dropout rate
+        max_total_tokens (int): Maximum sequence length
+        use_rope (bool): Use RoPE if True
+        num_features (int): Number of features in the time series
+        activation (str): "relu" or "gelu"
+
+    Inputs:
+        time_series (Tensor): Shape (B, seq_len, num_features)
+        mask (Tensor): Shape (B, seq_len)
+
+    Outputs:
+        local_embeddings (Tensor): Shape (B, seq_len, num_features, d_proj)
+    """
+    def forward(self, time_series, mask):
+        """Forward pass to generate local embeddings."""
         if time_series.dim() == 2:
             time_series = time_series.unsqueeze(-1)
 
@@ -310,57 +337,265 @@ class TimeSeriesEncoder(nn.Module):
             time_series = F.pad(time_series, (0, 0, 0, pad_amount), value=0)
             mask = F.pad(mask, (0, pad_amount), value=0)
 
+        '''
+        =============================== Global IDEA ==============================
+        (B, seq_len, num_features) -> (B, num_features * num_patches, patch_size)
+        This flattening approach allows to process channels together in every patch
+        '''
+
         # Variate-Window Tokenization
 
         ## Patching by time dimension -- Window Tokenization
         num_patches = padded_length // self.patch_size
-        total_length = num_patches * num_features
+        # (B, seq_len, num_features) -> (B, num_patches, patch_size, num_features)
         patches = time_series.view(B, num_patches, self.patch_size, num_features)
 
-        # Variate Tokenization
+        ## Variate Tokenization -- flatten num_features & num_patches
         patches = patches.permute(0, 3, 1, 2).contiguous()  # (B, num_features, num_patches, patch_size)
-        patches = patches.view(B, num_features * num_patches, self.patch_size)  # (B, L, patch_size)
-        
-        ## Feature ID для идентификации каналов
-        feature_id = torch.arange(num_features, device=device).repeat_interleave(
-            num_patches)  # (num_features * num_patches = L,)
-        feature_id = feature_id.unsqueeze(0).expand(B, -1)  # (B, L)
+        patches = patches.view(B, num_features * num_patches, self.patch_size)  # (B, num_features * num_patches, patch_size)
 
-        ## Embed patches
-        embedded_patches = self.embedding_layer(patches)  # (B, L, d_model)
+        ## Embed patches (last dim)
+        # (B, num_features * num_patches, patch_size) -> (B, num_features * num_patches, d_model)
+        embedded_patches = self.embedding_layer(patches)
 
         ## Create patch-level mask
+        # (B, seq_len) -> (B, num_patches, patch_size)
         mask = mask.view(B, num_patches, self.patch_size)
+        # mask full patch as an element
         patch_mask = mask.sum(dim=-1) > 0  # (B, num_patches)
-        full_mask = patch_mask.unsqueeze(1).expand(-1, num_features, -1)  # (B, num_features, num_patches)
-        full_mask = full_mask.reshape(B, num_features * num_patches)  # (B, L)
 
-        ## Generate RoPE frequencies if applicable
+        ## Convert to (B, num_features * num_patches)
+        full_mask = patch_mask.unsqueeze(1).expand(-1, num_features, -1)  # (B, num_features, num_patches)
+        full_mask = full_mask.reshape(B, num_features * num_patches)  # (B, num_features * num_patches)
+
+        ## Generate RoPE frequencies
         if self.use_rope:
+            total_length = num_patches * num_features
             rope_freqs = self.rope_embedder(total_length).to(device)
         else:
             rope_freqs = None
 
         # Encode sequence
         if num_features > 1:
-            output = self.transformer_encoder(
-                embedded_patches,
-                rope_freqs=rope_freqs,
-                src_id=feature_id,
-                attn_mask=full_mask
-            )
+            # Using Any-Variate Attention
+            ## Feature ID for channel identification (aka PatchTST)
+            feature_id = torch.arange(num_features, device=device).repeat_interleave(num_patches)
+            feature_id = feature_id.unsqueeze(0).expand(B, -1)  # (B, num_features * num_patches)
         else:
-            output = self.transformer_encoder(
-                embedded_patches,
-                rope_freqs=rope_freqs,
-                attn_mask=full_mask
-            )
+            feature_id = None
+
+        output = self.transformer_encoder(
+            embedded_patches,
+            rope_freqs=rope_freqs,
+            src_id=feature_id,
+            attn_mask=full_mask
+        )  # (B, num_features * num_patches, d_model)
 
         # Extract and project local embeddings
-        patch_embeddings = output  # (B, L, d_model)
-        patch_proj = self.projection_layer(patch_embeddings)  # (B, L, patch_size * d_proj)
-        local_embeddings = patch_proj.view(B, num_features, num_patches, self.patch_size, self.d_proj)
+        patch_proj = self.projection_layer(output)  # (B, num_features * num_patches, patch_size * d_proj)
+
+        # Reverse reshape
+        local_embeddings = patch_proj.view(B, num_features, num_patches, self.patch_size, self.d_proj) # unfold
         local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4)  # (B, num_patches, patch_size, num_features, d_proj)
+        local_embeddings = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]  # (B, seq_len, num_features, d_proj)
+
+        return local_embeddings
+
+
+class TimeSeriesEncoderIndependent(TimeSeriesEncoderBase):
+    """
+    Time Series Encoder using channel-independent strategy aka MOMENT
+
+    Args:
+        d_model (int): Model dimension
+        d_proj (int): Projection dimension
+        patch_size (int): Size of each patch
+        num_layers (int): Number of encoder layers
+        num_heads (int): Number of attention heads
+        d_ff_dropout (float): Dropout rate
+        max_total_tokens (int): Maximum sequence length
+        use_rope (bool): Use RoPE if True
+        num_features (int): Number of features in the time series
+        activation (str): "relu" or "gelu"
+
+    Inputs:
+        time_series (Tensor): Shape (batch_size, seq_len, num_features)
+        mask (Tensor): Shape (batch_size, seq_len)
+
+    Outputs:
+        local_embeddings (Tensor): Shape (batch_size, seq_len, num_features, d_proj)
+    """
+    def forward(self, time_series, mask):
+        """Forward pass to generate local embeddings."""
+        if time_series.dim() == 2:
+            time_series = time_series.unsqueeze(-1)
+
+        device = time_series.device
+        B, seq_len, num_features = time_series.size()
+        assert num_features == self.num_features, f"Number of features mismatch with data: {num_features} vs param: {self.num_features}"
+        assert mask.size() == (B, seq_len), "Mask shape mismatch"
+
+        # Pad sequence to be divisible by patch_size
+        padded_length = math.ceil(seq_len / self.patch_size) * self.patch_size
+        if padded_length > seq_len:
+            pad_amount = padded_length - seq_len
+            time_series = F.pad(time_series, (0, 0, 0, pad_amount), value=0)
+            mask = F.pad(mask, (0, pad_amount), value=0)
+
+        '''
+        =============================== Global IDEA ==============================
+        (B, seq_len, num_features) -> (B * num_features, num_patches, patch_size)
+        This allows to process every variate independent and vectorized
+        '''
+
+        # Reshape to process **every channel as a batch**
+        time_series_ci = time_series.permute(0, 2, 1)  # (B, num_features, seq_len)
+        time_series_ci = time_series_ci.reshape(B * num_features, -1)  # (B * num_features, seq_len)
+
+        mask_ci = mask.unsqueeze(1).expand(-1, num_features, -1)  # (B, num_features, seq_len)
+        mask_ci = mask_ci.reshape(B * num_features, seq_len)  # (B * num_features, seq_len)
+
+        # Variate-Window Independent Tokenization
+
+        ## Patching by time dimension
+        num_patches = padded_length // self.patch_size
+        patches = time_series_ci.view(B * num_features, num_patches, self.patch_size)  # (B * num_features, num_patches, patch_size)
+
+        ## Patch-level mask
+        mask_patches = mask_ci.view(B * num_features, num_patches, self.patch_size)  # (B * num_features, num_patches, patch_size)
+        # mask full patch as an element
+        patch_mask = mask_patches.sum(dim=-1) > 0  # (B * num_features, num_patches)
+
+        ## Embed patches (last dim)
+        # (B * num_features, num_patches, patch_size) -> (B * num_features, num_patches, d_model)
+        embedded_patches = self.embedding_layer(patches)
+
+        ## Generate RoPE frequencies
+        if self.use_rope:
+            rope_freqs = self.rope_embedder(num_patches).to(device)
+        else:
+            rope_freqs = None
+
+        # Encode sequence
+        output = self.transformer_encoder(
+            embedded_patches,
+            rope_freqs=rope_freqs,
+            attn_mask=patch_mask
+        ) # (B * num_features, num_patches, d_model)
+
+        # Extract and project local embeddings
+        patch_proj = self.projection_layer(output)  # (B * num_features, num_patches, patch_size * d_proj)
+
+        # Reverse reshape
+        local_embeddings = patch_proj.view(B, num_features, num_patches, self.patch_size, self.d_proj) # unfold
+        local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4)  # (B, num_patches, patch_size, num_features, d_proj)
+        local_embeddings = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]  # (B, seq_len, num_features, d_proj)
+
+        return local_embeddings
+
+
+class TimeSeriesEncoderMixing(TimeSeriesEncoderBase):
+    """
+    Time Series Encoder using channel-mixing strategy
+
+    Args:
+        d_model (int): Model dimension
+        d_proj (int): Projection dimension
+        patch_size (int): Size of each patch
+        num_layers (int): Number of encoder layers
+        num_heads (int): Number of attention heads
+        d_ff_dropout (float): Dropout rate
+        max_total_tokens (int): Maximum sequence length
+        use_rope (bool): Use RoPE if True
+        num_features (int): Number of features in the time series
+        activation (str): "relu" or "gelu"
+
+    Inputs:
+        time_series (Tensor): Shape (batch_size, seq_len, num_features)
+        mask (Tensor): Shape (batch_size, seq_len)
+
+    Outputs:
+        local_embeddings (Tensor): Shape (batch_size, seq_len, num_features, d_proj)
+    """
+    def __init__(self, d_model=2048, d_proj=512, patch_size=32, num_layers=6, num_heads=8,
+                 d_ff_dropout=0.1, max_total_tokens=8192, use_rope=True, num_features=1,
+                 activation="relu"):
+        super().__init__(d_model, d_proj, patch_size, num_layers, num_heads,
+                 d_ff_dropout, max_total_tokens, use_rope, num_features,
+                 activation)
+
+        # Patch embedding layer
+        '''
+        Note: embed every patch with channels -> mixing mechanism
+        Intput: patch_size * num_features shape, not only patch_size!
+        '''
+        self.embedding_layer = nn.Linear(patch_size * num_features, d_model)
+
+    def forward(self, time_series, mask):
+        """Forward pass to generate local embeddings."""
+        if time_series.dim() == 2:
+            time_series = time_series.unsqueeze(-1)
+
+        device = time_series.device
+        B, seq_len, num_features = time_series.size()
+        assert num_features == self.num_features, f"Number of features mismatch with data: {num_features} vs param: {self.num_features}"
+        assert mask.size() == (B, seq_len), "Mask shape mismatch"
+
+        # Pad sequence to be divisible by patch_size
+        padded_length = math.ceil(seq_len / self.patch_size) * self.patch_size
+        if padded_length > seq_len:
+            pad_amount = padded_length - seq_len
+            time_series = F.pad(time_series, (0, 0, 0, pad_amount), value=0)
+            mask = F.pad(mask, (0, pad_amount), value=0)
+
+        '''
+        =============================== Global IDEA ==============================
+        (B, seq_len, num_features) -> (B, num_patches, patch_size * num_features)
+        Then all channels will be mixed into one embedding
+        This mixing approach allows to process channels together in every patch
+        '''
+
+        # Variate-Window Mixing Tokenization
+
+        ## Patching by time dimension -- Window Tokenization
+        num_patches = padded_length // self.patch_size
+        patches = time_series.view(B, num_patches, self.patch_size, num_features)  # (B, num_patches, patch_size, num_features)
+
+        ## Variate Tokenization -- patch_size & num_features into token
+        patches = patches.view(B, num_patches, self.patch_size * num_features)  # (B, num_patches, patch_size * num_features)
+
+        ## Embed patches (last dim)
+        # (B, num_patches, patch_size * num_features) -> (B, num_patches, d_model)
+        embedded_patches = self.embedding_layer(patches)
+
+        ## Patch-level mask
+        # (B, seq_len) -> (B, num_patches, patch_size)
+        mask_patches = mask.view(B, num_patches, self.patch_size)
+        # mask full patch as an element
+        patch_mask = mask_patches.sum(dim=-1) > 0  # (B, num_patches)
+
+        if self.use_rope:
+            # Every token -- patch with all channels
+            total_length = num_patches
+            rope_freqs = self.rope_embedder(total_length).to(device)
+        else:
+            rope_freqs = None
+
+        # Encode sequence
+        output = self.transformer_encoder(
+            embedded_patches,
+            rope_freqs=rope_freqs,
+            attn_mask=patch_mask
+        )  # (B, num_patches, d_model)
+
+        # Extract and project local embeddings
+        patch_proj = self.projection_layer(output)  # (B, num_patches, patch_size * d_proj)
+
+        # Reverse reshape
+        local_embeddings = patch_proj.view(B, num_patches, self.patch_size, self.d_proj)  # unfold
+        # Repeat embedding for every channel (equal for every channel)
+        local_embeddings = local_embeddings.unsqueeze(3)  # (B, num_patches, patch_size, 1, d_proj)
+        local_embeddings = local_embeddings.expand(-1, -1, -1, num_features, -1)
         local_embeddings = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]  # (B, seq_len, num_features, d_proj)
 
         return local_embeddings

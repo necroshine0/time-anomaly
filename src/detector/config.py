@@ -16,7 +16,8 @@ class DetectorConfig:
         use_rope: Whether to use Rotary Position Embedding.
         activation: Activation function name.
         num_features: Number of input features.
-        use_anomaly_head: Whether to use and train anomaly_head
+        channel_strategy: Channels mixing strategy.
+                          One of `flatten` (TimeRCD), `independent` (MOMENT), `mixing`.
     """
     d_model: int = 512
     d_proj: int = 256
@@ -28,7 +29,7 @@ class DetectorConfig:
     use_rope: bool = True
     activation: str = "gelu"
     num_features: int = 1
-    use_anomaly_head: bool = True
+    channel_strategy: str = "flatten"
 
     def to_dict(self) -> Dict[str, any]:
         return self.__dict__

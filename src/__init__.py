@@ -10,6 +10,7 @@ from .functional import (
 	save_checkpoint,
 	load_checkpoint,
 	predict_batch,
+	compute_best_metrics,
 	benchmark,
 	plot_training_results,
 	visualize_batch_sample,

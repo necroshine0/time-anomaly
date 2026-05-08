@@ -463,7 +463,8 @@ disable=raw-checker-failed,
         superfluous-parens,
         consider-using-from-import,
         invalid-name,
-        unnecessary-comprehension
+        unnecessary-comprehension,
+        consider-using-enumerate,
 
 
 # Enable the message, report, category or checker with the given id(s). You can

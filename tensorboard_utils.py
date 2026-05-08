@@ -31,9 +31,5 @@ def log_losses(writer: SummaryWriter, losses: dict):
     valid_losses = losses["valid_losses"]
 
     for i, epoch in enumerate(epochs):
-        writer.add_scalar("Loss/Total/train", train_losses["total"][i], epoch)
-        writer.add_scalar("Loss/Total/valid", valid_losses["total"][i], epoch)
         writer.add_scalar("Loss/Reconstruction/train", train_losses["reconstruction"][i], epoch)
         writer.add_scalar("Loss/Reconstruction/valid", valid_losses["reconstruction"][i], epoch)
-        writer.add_scalar("Loss/Anomaly/train", train_losses["anomaly"][i], epoch)
-        writer.add_scalar("Loss/Anomaly/valid", valid_losses["anomaly"][i], epoch)

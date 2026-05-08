@@ -13,13 +13,12 @@ class TrainingConfig:
         max_seq_len: Maximum sequence length.
         overlap_ratio: Overlab ratio between sequences splits.
         accumulation_steps: Gradient accumulation steps.
-        alpha: Weight of anomaly loss component (alpha * anomaly).
         weight_decay: Weight decay for optimization.
         enable_ts_train: Whether to train the time series encoder.
         mixed_precision: Whether to use AMP.
         seed: Random seed for reproducibility.
         checkpoint_dir: Path to where to checkpoint model.
-        checkpoint_step: Number of epochs to checkpoint. -1 if only last.
+        checkpoint_step: Number of epochs to checkpoint. -1 if only best.
         early_stopping_patience: Early stoppint iteration restriction
         verbose: Whether to print info
     """
@@ -31,7 +30,6 @@ class TrainingConfig:
     max_seq_len: int = 512
     overlap_ratio: float = 0.0
     accumulation_steps: int = 1
-    alpha: float = 1.0
     weight_decay: float = 1e-5
     enable_ts_train: bool = False
     mixed_precision: bool = False

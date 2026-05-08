@@ -7,17 +7,32 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import DetectorConfig
-from .modules import TimeSeriesEncoder
+from .modules import (
+    TimeSeriesEncoderFlatten,
+    TimeSeriesEncoderIndependent,
+    TimeSeriesEncoderMixing,
+)
+
+
+ENCODERS = {
+    "flatten": TimeSeriesEncoderFlatten,
+    "independent": TimeSeriesEncoderIndependent,
+    "mixing": TimeSeriesEncoderMixing,
+}
 
 
 class Detector(nn.Module):
-    """Model for time series pretraining with masked reconstruction and anomaly detection."""
+    """Model for time series pretraining with masked reconstruction."""
     def __init__(self, config: DetectorConfig):
         super().__init__()
         self.config = config
 
         # Extract TimeSeriesEncoder parameters from config
-        self.ts_encoder = TimeSeriesEncoder(
+        encoder_class = ENCODERS.get(config.channel_strategy, None)
+        if encoder_class is None:
+            raise ValueError(f"Unknown channel_strategy={config.channel_strategy}")
+
+        self.ts_encoder = encoder_class(
             d_model=config.d_model,
             d_proj=config.d_proj,
             patch_size=config.patch_size,
@@ -39,15 +54,6 @@ class Detector(nn.Module):
             nn.Dropout(config.d_ff_dropout),
             nn.Linear(config.d_proj * 4, 1)  # (B, seq_len, num_features, 1)
         )
-
-        # Anomaly detection head
-        if self.config.use_anomaly_head:
-            self.anomaly_head = nn.Sequential(
-                nn.Linear(config.d_proj, config.d_proj // 2),
-                nn.GELU(),
-                nn.Dropout(config.d_ff_dropout),
-                nn.Linear(config.d_proj // 2, 2)  # (B, seq_len, num_features, 2) for binary classification
-            )
 
     def forward(self,
             time_series: torch.Tensor,
@@ -74,24 +80,3 @@ class Detector(nn.Module):
             original_time_series[mask_expanded]
         )
         return reconstruction_loss
-
-    def anomaly_detection_loss(self,
-                               local_embeddings: torch.Tensor,  # (B, seq_len, num_features, d_proj)
-                               labels: torch.Tensor,  # (B, seq_len)
-                               ) -> torch.Tensor:  # (B, seq_len)
-        """Compute anomaly detection loss for each timestep."""
-        if not self.config.use_anomaly_head:
-            return torch.tensor(0.0, device=local_embeddings.device, requires_grad=False)
-
-        # Project local embeddings to anomaly scores
-        logits = self.anomaly_head(local_embeddings)  # (B, seq_len, num_features, 2)
-        logits = torch.mean(logits, dim=-2)  # Average over num_features to get (B, seq_len, 2)
-
-        # Reshape for loss computation
-        batch_size, seq_len, _ = logits.shape
-        logits = logits.view(batch_size * seq_len, 2)  # (B*seq_len, 2)
-        labels = labels.view(batch_size * seq_len)
-
-        # Compute loss
-        anomaly_loss = F.cross_entropy(logits, labels, ignore_index=-100)
-        return anomaly_loss

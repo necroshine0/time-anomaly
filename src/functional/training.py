@@ -7,13 +7,9 @@ from typing import Union, Optional
 
 import torch
 from torch import nn
-import torch.nn.functional as F
-
-from sklearn.metrics import (
-    f1_score, precision_score, recall_score, roc_auc_score
-)
 
 from .config import TrainingConfig
+from .metrics import compute_best_metrics
 
 
 def set_seed(seed: int) -> None:
@@ -40,14 +36,13 @@ def unwrap_batch(batch, device):
 
 
 def compute_batch_loss(model, batch, device):
-    time_series, masked_time_series, mask, labels, attention_mask = unwrap_batch(batch, device)
+    time_series, masked_time_series, mask, _, attention_mask = unwrap_batch(batch, device)
     local_embeddings = model(masked_time_series, attention_mask & (~mask.bool()))
     recon_loss = model.masked_reconstruction_loss(local_embeddings, time_series, mask)
-    anomaly_loss = model.anomaly_detection_loss(local_embeddings, labels)
-    return recon_loss, anomaly_loss
+    return recon_loss
 
 
-def predict_batch(model, batch, device, anomaly_key="logits"):
+def predict_batch(model, batch, device):
     time_series, masked_time_series, mask, labels, attention_mask = unwrap_batch(batch, device)
     batch_size, seq_len, num_features = time_series.shape
 
@@ -59,23 +54,8 @@ def predict_batch(model, batch, device, anomaly_key="logits"):
         reconstructed = model.reconstruction_head(local_embeddings)
         reconstructed = reconstructed.view(batch_size, seq_len, num_features)  # (B, seq_len, num_features)
 
-        # Get anomaly predictions
-        if hasattr(model, "anomaly_head"):
-            logits = model.anomaly_head(local_embeddings)
-            logits = torch.mean(logits, dim=-2)  # (B, seq_len, 2)
-            anomaly_probs = F.softmax(logits, dim=-1)[..., 1]  # Probability of anomaly (B, seq_len)
-            anomaly_logits = logits[..., 1] - logits[..., 0]  # Anomaly logits (B, seq_len)
-
-            if anomaly_key == "probs":
-                anomaly_scores = anomaly_probs
-            elif anomaly_key == "logits":
-                anomaly_scores = anomaly_logits
-            else:
-                raise ValueError(f"Invalid anomaly_key value: {anomaly_key}")
-        else:
-            if anomaly_key != "logits":
-                raise ValueError(f"In reconstruction only setting anomaly_key value must be 'logits', but got: {anomaly_key}")
-            anomaly_scores = ((reconstructed - time_series) ** 2).mean(dim=-1)
+        # Get anomaly scores
+        anomaly_scores = ((reconstructed - time_series) ** 2).mean(dim=-1)
 
         return {
             'original':       time_series.cpu(),
@@ -100,9 +80,7 @@ def train_epoch(
     """Train for one epoch with multiple pretraining tasks."""
     model.train()
 
-    total_loss = 0.0
     total_recon_loss = 0.0
-    total_anomaly_loss = 0.0
     num_batches = 0
     log_freq = max(1, int(getattr(config, 'log_freq', 10)))
     accumulation_steps = getattr(config, 'accumulation_steps', 1)
@@ -116,13 +94,11 @@ def train_epoch(
 
         if config.mixed_precision and scaler is not None:
             with torch.amp.autocast('cuda'):
-                recon_loss, anomaly_loss = compute_batch_loss(model, batch, device)
-            total_loss_batch = recon_loss + config.alpha * anomaly_loss
-            scaler.scale(total_loss_batch).backward()
+                recon_loss = compute_batch_loss(model, batch, device)
+            scaler.scale(recon_loss).backward()
         else:
-            recon_loss, anomaly_loss = compute_batch_loss(model, batch, device)
-            total_loss_batch = recon_loss + config.alpha * anomaly_loss
-            total_loss_batch.backward()
+            recon_loss = compute_batch_loss(model, batch, device)
+            recon_loss.backward()
 
         if (batch_idx + 1) % accumulation_steps == 0:
             if config.mixed_precision and scaler is not None:
@@ -132,28 +108,21 @@ def train_epoch(
                 optimizer.step()
 
         # Accumulate losses
-        total_loss += total_loss_batch.item()
         total_recon_loss += recon_loss.item()
-        total_anomaly_loss += anomaly_loss.item()
         num_batches += 1
 
         # Log progress based on log_freq
         if batch_idx % log_freq == 0 and config.verbose == 2:
             print(f"Epoch {epoch}, Batch {batch_idx}/{len(loader)}")
-            print(f"  Total Loss: {total_loss_batch.item():.4f}")
             print(f"  Recon Loss: {recon_loss.item():.4f}")
-            print(f"  Anomaly Loss: {anomaly_loss.item():.4f}")
 
-    avg_loss = total_loss / num_batches
     avg_recon_loss = total_recon_loss / num_batches
-    avg_anomaly_loss = total_anomaly_loss / num_batches
 
-    if config.verbose == 2 or (config.verbose == 1 and epoch % config.checkpoint_step == 0):
-        print(f"\nEpoch {epoch} completed:")
-        print(f"  Average Total Loss: {avg_loss:.4f}")
-        print(f"  Average Recon Loss: {avg_recon_loss:.4f}")
-        print(f"  Average Anomaly Loss: {avg_anomaly_loss:.4f}")
-    return avg_loss, avg_recon_loss, avg_anomaly_loss
+    if config.checkpoint_step > 0:
+        if config.verbose == 2 or (config.verbose == 1 and epoch % config.checkpoint_step == 0):
+            print(f"\nEpoch {epoch} completed:")
+            print(f"  Average Recon Loss: {avg_recon_loss:.4f}")
+    return avg_recon_loss
 
 
 def evaluate_epoch(
@@ -166,31 +135,23 @@ def evaluate_epoch(
     """Evaluate model on test dataset."""
     model.eval()
 
-    total_loss = 0.0
     total_recon_loss = 0.0
-    total_anomaly_loss = 0.0
     num_batches = 0
     test_batch_limit = min(len(loader), getattr(config, 'test_batch_limit', len(loader)))
 
     with torch.no_grad():
         for batch in itertools.islice(loader, test_batch_limit):
-            recon_loss, anomaly_loss = compute_batch_loss(model, batch, device)
-            total_loss_batch = recon_loss + config.alpha * anomaly_loss
-            total_loss += total_loss_batch.item()
+            recon_loss = compute_batch_loss(model, batch, device)
             total_recon_loss += recon_loss.item()
-            total_anomaly_loss += anomaly_loss.item()
             num_batches += 1
 
-    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     avg_recon_loss = total_recon_loss / num_batches if num_batches > 0 else 0.0
-    avg_anomaly_loss = total_anomaly_loss / num_batches if num_batches > 0 else 0.0
 
-    if config.verbose == 2 or (config.verbose == 1 and epoch % config.checkpoint_step == 0):
-        print(f"\nEpoch {epoch} validated:")
-        print(f"  Average Total Loss: {avg_loss:.4f}")
-        print(f"  Average Recon Loss: {avg_recon_loss:.4f}")
-        print(f"  Average Anomaly Loss: {avg_anomaly_loss:.4f}")
-    return avg_loss, avg_recon_loss, avg_anomaly_loss
+    if config.checkpoint_step > 0:
+        if config.verbose == 2 or (config.verbose == 1 and epoch % config.checkpoint_step == 0):
+            print(f"\nEpoch {epoch} validated:")
+            print(f"  Average Recon Loss: {avg_recon_loss:.4f}")
+    return avg_recon_loss
 
 
 def save_checkpoint(
@@ -227,7 +188,7 @@ def save_checkpoint(
     torch.save(checkpoint, latest_path)
 
     # Save the checkpoint at specified frequency
-    if checkpoint_step > 0 and (epoch % checkpoint_step == 0 or epoch == config.num_epochs - 1):
+    if checkpoint_step > 0 and (epoch % checkpoint_step == 0 or epoch == config.num_epochs):
         save_path = os.path.join(config.checkpoint_dir, f"pretrain_checkpoint_epoch_{epoch}.pth")
         torch.save(checkpoint, save_path)
         if config.verbose == 2:
@@ -350,26 +311,22 @@ def train_worker(
         print(f"Total training batches per process: {len(train_loader)}")
         print(f"Early stopping patience: {early_stopping_patience} epochs")
 
-    train_losses = {"total": [], "reconstruction": [], "anomaly": []}
-    valid_losses = {"total": [], "reconstruction": [], "anomaly": []}
+    train_losses = {"reconstruction": []}
+    valid_losses = {"reconstruction": []}
     epochs = []
     for epoch in tqdm(range(start_epoch, config.num_epochs + 1)):
-        train_total, train_recon, train_anomaly = train_epoch(config, model, optimizer, train_loader, device, epoch, scaler)
-        train_losses["total"].append(train_total)
+        train_recon = train_epoch(config, model, optimizer, train_loader, device, epoch, scaler)
         train_losses["reconstruction"].append(train_recon)
-        train_losses["anomaly"].append(train_anomaly)
 
-        valid_total, valid_recon, valid_anomaly = evaluate_epoch(config, model, valid_loader, device, epoch)
-        valid_losses["total"].append(valid_total)
+        valid_recon = evaluate_epoch(config, model, valid_loader, device, epoch)
         valid_losses["reconstruction"].append(valid_recon)
-        valid_losses["anomaly"].append(valid_anomaly)
 
         epochs.append(epoch)
 
         # Check if this is the best model so far
-        is_best = valid_total < best_valid_loss
+        is_best = valid_recon < best_valid_loss
         if is_best:
-            best_valid_loss = valid_total
+            best_valid_loss = valid_recon
             patience_counter = 0
             if config.verbose == 2:
                 print(f"\nNew best validation loss: {best_valid_loss:.4f}")
@@ -378,8 +335,7 @@ def train_worker(
             if config.verbose == 2:
                 print(f"\nValidation loss did not improve. Patience: {patience_counter}/{early_stopping_patience}")
 
-        # Save checkpoint with best model flag
-        save_checkpoint(config, model, optimizer, epoch, valid_total, scaler, is_best)
+        save_checkpoint(config, model, optimizer, epoch, valid_recon, scaler, is_best)
 
         # Early stopping check
         if patience_counter >= early_stopping_patience:
@@ -395,19 +351,19 @@ def benchmark(
         model: nn.Module,
         loader: torch.utils.data.DataLoader,
         device: Union[torch.device, str],
-        anomaly_key: str = "logits",
+        **kwargs
     ):
     # FIXME: реализовать window_size + stride (https://chat.deepseek.com/a/chat/s/60a44086-6405-4cc7-870b-378fe769485a)
     # Нужно брать перекрывающиеся батчи, чтобы правильноу улавливать аномалии на границах батчей
-    assert anomaly_key in ["probs", "logits"]
     model.eval()
 
+    # Flatten dataset
     anomaly_scores = []
     true_labels = []
     original = []
     reconstructed = []
     for batch in loader:
-        result = predict_batch(model, batch, device, anomaly_key)
+        result = predict_batch(model, batch, device)
         attn_mask = result['attention_mask']
         anomaly_scores.append(result['anomaly_scores'][attn_mask].numpy())
         true_labels.append(result['true_labels'][attn_mask].numpy())
@@ -426,26 +382,7 @@ def benchmark(
         if anomaly_scores.shape[1] != 1:
             raise NotImplementedError()
         anomaly_scores = anomaly_scores.reshape(-1)
-    
-    metrics = {}
 
-    diff = original - reconstructed
-    metrics["RMSE"] = np.sqrt((diff ** 2).mean().mean())
-    metrics["MAE"] = np.abs(diff).mean().mean()
-    metrics["AUC-ROC"] = roc_auc_score(true_labels, anomaly_scores)
-    if anomaly_key == "probs":
-        for t in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
-            pred_labels = (anomaly_scores > t).astype(int)
-            metrics[f"F1, t>{t}"]        = f1_score(true_labels, pred_labels)
-            metrics[f"Precision, t>{t}"] = precision_score(true_labels, pred_labels)
-            metrics[f"Recall, t>{t}"]    = recall_score(true_labels, pred_labels)
-    else:
-        # https://github.com/thu-sail-lab/Time-RCD/blob/tsb-ad-integration/main.py#L305
-        mean = np.mean(anomaly_scores)
-        std = np.std(anomaly_scores)
-        pred_labels = (anomaly_scores > (mean + 3 * std))
-        metrics["F1"]        = f1_score(true_labels, pred_labels)
-        metrics["Precision"] = precision_score(true_labels, pred_labels)
-        metrics["Recall"]    = recall_score(true_labels, pred_labels)
-
+    metrics = compute_best_metrics(true_labels, anomaly_scores,
+                                   original, reconstructed, **kwargs)
     return metrics
