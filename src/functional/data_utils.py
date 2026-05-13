@@ -8,6 +8,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import (
     MaxAbsScaler,
     MinMaxScaler,
+    StandardScaler,
 )
 
 
@@ -109,7 +110,8 @@ def create_random_mask(time_series: torch.Tensor,  #(B, max_seq_len, num_feature
 
 def collate_fn(batch):
     """Collate function for pretraining dataset."""
-    time_series_list, labels_list = zip(*batch)
+    time_series_list = [item[0] for item in batch]
+    labels_list = [item[1] for item in batch] if len(batch[0]) > 1 else None
 
     # Convert to tensors and pad sequences
     if time_series_list[0].ndim == 1:
@@ -137,14 +139,10 @@ def collate_fn(batch):
     #     stds.append(std)
     #     time_series_tensors[i] = (ts - mean) / std
 
-    labels = [label for label in labels_list]
     # Pad time series to same length
     padded_time_series = torch.nn.utils.rnn.pad_sequence(
         time_series_tensors, batch_first=True, padding_value=0.0
     )  # (B, max_seq_len, num_features)
-    padded_labels = torch.nn.utils.rnn.pad_sequence(
-        labels, batch_first=True, padding_value=-100
-    )  # (B, max_seq_len)
 
     sequence_lengths = [ts.size(0) for ts in time_series_tensors]
     B, max_seq_len, num_features = padded_time_series.shape
@@ -155,13 +153,21 @@ def collate_fn(batch):
     # Create random masks for reconstruction task - only mask valid sequence parts
     masked_time_series, mask = create_random_mask(padded_time_series, attention_mask)
 
-    return {
+    out = {
         'time_series': padded_time_series,
         'masked_time_series': masked_time_series,
         'mask': mask,  # for reconstruction task
-        'labels': padded_labels,
         'attention_mask': attention_mask,  # for padding
     }
+
+    if labels_list is not None:
+        labels = [label for label in labels_list]
+        padded_labels = torch.nn.utils.rnn.pad_sequence(
+            labels, batch_first=True, padding_value=-100
+        )  # (B, max_seq_len)
+        out['labels'] = padded_labels
+    return out
+
 
 
 # TimeRCD_pretrain_multi.py
@@ -193,17 +199,22 @@ def get_DAE_loaders(folder, config, **kwargs):
         'pattern_trendv2': MinMaxScaler,    
     }
 
-    X_train = np.load(f"{folder}/train.npy")
-    X_test  = np.load(f"{folder}/test.npy")
-    X_valid = np.load(f"{folder}/validation.npy")
-    y_train = np.load(f"{folder}/labels.npy")
+    X_train = np.load(f"{folder}/train.npy") # 20000, no target
+    X_valid = np.load(f"{folder}/validation.npy") # 10000, target
+    X_test  = np.load(f"{folder}/test.npy") # 20000, target
+
     y_valid = np.load(f"{folder}/labels_validation.npy")
+    y_test = np.load(f"{folder}/labels.npy")
 
     # Если аномалия в одном измерении -> аномалия во всех измерениях
-    y_train = y_train.max(axis=-1).flatten().astype(int)
     y_valid = y_valid.max(axis=-1).flatten().astype(int)
+    y_test = y_test.max(axis=-1).flatten().astype(int)
+
+    if config.max_samples > 0:
+        X_train = X_train[:config.max_samples]
 
     name = os.path.split(folder)[-1]
+    # Нет необходимости -- уже отскейлено
     # scaler = SCALERS_DEF.get(name, MinMaxScaler)
     # scaler = scaler(**kwargs).fit(X_train)
 
@@ -213,37 +224,37 @@ def get_DAE_loaders(folder, config, **kwargs):
 
     overlap_ratio = config.overlap_ratio
     max_seq_len = config.max_seq_len
-    X_train_seq, y_train_seq = split_ts_sequences(
-        X_train, y_train, max_seq_len=max_seq_len,
+    X_train_seq = split_ts_sequences(
+        X_train, max_seq_len=max_seq_len,
         overlap_ratio=overlap_ratio
     )
     X_valid_seq, y_valid_seq = split_ts_sequences(
         X_valid, y_valid, max_seq_len=max_seq_len,
         overlap_ratio=overlap_ratio
     )
-    X_test_seq = split_ts_sequences(
-        X_test, max_seq_len=max_seq_len,
+    X_test_seq, y_test_seq = split_ts_sequences(
+        X_test, y_test, max_seq_len=max_seq_len,
         overlap_ratio=overlap_ratio
     )
 
     print(name)
     print(f"    X_train: {X_train_seq.shape}")
-    print(f"    y_train: {y_train_seq.shape}")
     print(f"    X_valid: {X_valid_seq.shape}")
     print(f"    y_valid: {y_valid_seq.shape}")
     print(f"     X_test: {X_test_seq.shape}")
+    print(f"     y_test: {y_test_seq.shape}")
+    print()
 
     X_train_seq = torch.Tensor(X_train_seq)
     X_valid_seq = torch.Tensor(X_valid_seq)
     X_test_seq  = torch.Tensor(X_test_seq)
 
-    y_train_seq = torch.Tensor(y_train_seq).long()
     y_valid_seq = torch.Tensor(y_valid_seq).long()
-    y_test_seq  = torch.Tensor(np.zeros_like(X_test_seq)).long()
+    y_test_seq = torch.Tensor(y_test_seq).long()
 
-    train_dataset = TensorDataset(X_train_seq, y_train_seq)
+    train_dataset = TensorDataset(X_train_seq)
     valid_dataset = TensorDataset(X_valid_seq, y_valid_seq)
-    test_dataset  = TensorDataset(X_test_seq,  y_test_seq)
+    test_dataset  = TensorDataset(X_test_seq, y_test_seq)
 
     bs = config.batch_size
     loaders = {

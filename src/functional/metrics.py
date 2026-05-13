@@ -83,12 +83,13 @@ def get_best_threshold(y_true, y_scores, use_point_adjustment=True,
     return best_thresh
 
 
-def compute_best_metrics(y_true, y_scores, original_ts, reconstructed_ts, **kwargs):
+def compute_best_metrics(y_true, y_scores, original_ts, reconstructed_ts, best_thresh=None, **kwargs):
     # Reconstruction
     rmse, mae = calc_reconstruction_metrics(original_ts, reconstructed_ts)
 
     # Detection
-    best_thresh = get_best_threshold(y_true, y_scores, **kwargs)
+    if best_thresh is None:
+        best_thresh = get_best_threshold(y_true, y_scores, **kwargs)
     y_pred = 1 * (y_scores > best_thresh)
 
     f1, recall, precision, rocauc = calc_detection_metrics(y_true, y_pred, y_scores)

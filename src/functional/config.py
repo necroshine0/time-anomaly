@@ -21,6 +21,7 @@ class TrainingConfig:
         checkpoint_step: Number of epochs to checkpoint. -1 if only best.
         early_stopping_patience: Early stoppint iteration restriction
         verbose: Whether to print info
+        max_samples: How much samples to train on
     """
 
     # Training parameters
@@ -38,6 +39,7 @@ class TrainingConfig:
     checkpoint_step: int = -1
     early_stopping_patience: int = 10
     verbose: int = 1
+    max_samples: int = -1
 
     def to_dict(self) -> Dict[str, any]:
         return self.__dict__

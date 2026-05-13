@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from .config import TrainingConfig
-from .metrics import compute_best_metrics
+from .metrics import get_best_threshold, compute_best_metrics
 
 
 def set_seed(seed: int) -> None:
@@ -30,20 +30,23 @@ def unwrap_batch(batch, device):
     time_series = batch['time_series'].to(device)  # (B, max_seq_len, num_features)
     masked_time_series = batch['masked_time_series'].to(device)
     mask = batch['mask'].to(device)  # (B, max_seq_len)
-    labels = batch['labels'].to(device)
     attention_mask = batch['attention_mask'].to(device)
-    return time_series, masked_time_series, mask, labels, attention_mask
+    labels = batch.get('labels', None)
+    if labels is not None:
+        labels = labels.to(device)
+
+    return time_series, masked_time_series, mask, attention_mask, labels,
 
 
 def compute_batch_loss(model, batch, device):
-    time_series, masked_time_series, mask, _, attention_mask = unwrap_batch(batch, device)
+    time_series, masked_time_series, mask, attention_mask, _ = unwrap_batch(batch, device)
     local_embeddings = model(masked_time_series, attention_mask & (~mask.bool()))
     recon_loss = model.masked_reconstruction_loss(local_embeddings, time_series, mask)
     return recon_loss
 
 
 def predict_batch(model, batch, device):
-    time_series, masked_time_series, mask, labels, attention_mask = unwrap_batch(batch, device)
+    time_series, masked_time_series, mask, attention_mask, labels = unwrap_batch(batch, device)
     batch_size, seq_len, num_features = time_series.shape
 
     with torch.no_grad():
@@ -57,15 +60,17 @@ def predict_batch(model, batch, device):
         # Get anomaly scores
         anomaly_scores = ((reconstructed - time_series) ** 2).mean(dim=-1)
 
-        return {
+        out = {
             'original':       time_series.cpu(),
             'masked':         masked_time_series.cpu(),
             'reconstructed':  reconstructed.cpu(),
             'mask':           mask.bool().cpu(),
             'anomaly_scores': anomaly_scores.cpu(),
-            'true_labels':    labels.cpu(),
             'attention_mask': attention_mask.cpu(),
         }
+        if labels is not None:
+            out['true_labels'] = labels.cpu()
+        return out
 
 
 def train_epoch(
@@ -349,7 +354,8 @@ def train_worker(
 
 def benchmark(
         model: nn.Module,
-        loader: torch.utils.data.DataLoader,
+        valid_loader: torch.utils.data.DataLoader,
+        test_loader: torch.utils.data.DataLoader,
         device: Union[torch.device, str],
         **kwargs
     ):
@@ -357,12 +363,34 @@ def benchmark(
     # Нужно брать перекрывающиеся батчи, чтобы правильноу улавливать аномалии на границах батчей
     model.eval()
 
-    # Flatten dataset
+    # Считаем лучший порог на валидации
+    anomaly_scores = []
+    true_labels = []
+    for batch in valid_loader:
+        result = predict_batch(model, batch, device)
+        attn_mask = result['attention_mask']
+        anomaly_scores.append(result['anomaly_scores'][attn_mask].numpy())
+        true_labels.append(result['true_labels'][attn_mask].numpy())
+
+    anomaly_scores = np.concatenate(anomaly_scores)
+    true_labels = np.concatenate(true_labels)
+
+    if len(true_labels.shape) == 2:
+        true_labels = true_labels.reshape(-1)
+
+    if len(anomaly_scores.shape) == 2:
+        if anomaly_scores.shape[1] != 1:
+            raise NotImplementedError()
+        anomaly_scores = anomaly_scores.reshape(-1)
+
+    best_thresh = get_best_threshold(true_labels, anomaly_scores, **kwargs)
+
+    # Считаем метрики на тесте с учетом порога
     anomaly_scores = []
     true_labels = []
     original = []
     reconstructed = []
-    for batch in loader:
+    for batch in test_loader:
         result = predict_batch(model, batch, device)
         attn_mask = result['attention_mask']
         anomaly_scores.append(result['anomaly_scores'][attn_mask].numpy())
@@ -384,5 +412,6 @@ def benchmark(
         anomaly_scores = anomaly_scores.reshape(-1)
 
     metrics = compute_best_metrics(true_labels, anomaly_scores,
-                                   original, reconstructed, **kwargs)
+                                   original, reconstructed,
+                                   best_thresh, **kwargs)
     return metrics

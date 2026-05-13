@@ -265,6 +265,7 @@ class TimeSeriesEncoderBase(nn.Module):
                 num_layers=num_layers,
                 num_features=num_features
             )
+            self._init_parameters()
         else:
             # Standard encoder without RoPE
             encoder_layer = nn.TransformerEncoderLayer(
@@ -279,8 +280,7 @@ class TimeSeriesEncoderBase(nn.Module):
 
         # Output projection layers
         self.projection_layer = nn.Linear(d_model, patch_size * d_proj)
-        self._init_parameters()
-
+        
     def _init_parameters(self):
         for name, param in self.named_parameters():
             if 'weight' in name and 'linear' in name:
@@ -530,6 +530,7 @@ class TimeSeriesEncoderMixing(TimeSeriesEncoderBase):
         Intput: patch_size * num_features shape, not only patch_size!
         '''
         self.embedding_layer = nn.Linear(patch_size * num_features, d_model)
+        self.channel_embedding = nn.Embedding(num_features, d_proj)
 
     def forward(self, time_series, mask):
         """Forward pass to generate local embeddings."""
@@ -598,4 +599,10 @@ class TimeSeriesEncoderMixing(TimeSeriesEncoderBase):
         local_embeddings = local_embeddings.expand(-1, -1, -1, num_features, -1)
         local_embeddings = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]  # (B, seq_len, num_features, d_proj)
 
-        return local_embeddings
+        # Additive channel embedding (как positional encoding)
+        channel_embeds = self.channel_embedding(
+            torch.arange(num_features, device=local_embeddings.device)
+        )  # (num_features, d_proj)
+        channel_embeds = channel_embeds.unsqueeze(0).unsqueeze(0)  # (1, 1, num_features, d_proj)
+        
+        return local_embeddings + channel_embeds  # (B, seq_len, num_features, d_proj)
