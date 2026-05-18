@@ -180,7 +180,7 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-data/
-*.pth
+data/dump/
 exp/tensorboard_runs/
-exp/dump
+exp/dump/
+*.pth
