@@ -69,6 +69,6 @@
 
 ## Дополнительно
 
-В репозитории (**будет**) доступна итоговая [презентация](https://github.com/necroshine0/time-anomaly/blob/main/presentation.pdf).
+В репозитории доступна итоговая [презентация](https://github.com/necroshine0/time-anomaly/blob/main/presentation.pdf).
 
 В папке [`res-img`](https://github.com/necroshine0/time-anomaly/tree/main/src/res-img) собраны визуализации результатов для каждого набора данных
